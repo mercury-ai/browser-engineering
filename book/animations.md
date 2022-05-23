@@ -1402,47 +1402,35 @@ and management of animations via JavaScript.
 Composited animations
 =====================
 
-Compositing now works, but it doesn't yet achieve the goal of avoiding raster
-during animations. That's because `composite` is constantly re-running on every
-frame and keeps throwing away and re-creating the composited layers. In fact,
-at the moment it's probably *slower* than before, because the compositing
-algorithm takes time to run. Let's now add code to avoid all this work.
+Compositing works, but right now it's throwing away and re-creating
+the composited layers on every frame. It shouldn't. Avoiding this is
+simple in concept: keep track of what is animating, and re-run `draw`
+with different opacity parameters on the `CompositedLayer`s that are
+animating. If nothing else changes, then we don't need to re-composite
+or re-raster anything.
 
-Avoiding raster and the compositing algorithm is simple in concept: keep track
-of what is animating, and re-run `draw` with different opacity parameters on
-the `CompositedLayer`s that are animating. If nothing else changes, then
-we don't need to re-composite or re-raster anything.
+To do this we'll need to keep track of animations by some sort of id,
+so that the main thread can tell the browser thread which animations
+have run, and therefore which layers have changed. In our toy browser,
+we can use the `node` pointer for this. Add another `DisplayItem`
+constructor parameter indicating the `node` that painted that display
+item:
 
-To do this we'll need to keep track of anmations by some sort of id, and pass
-that id from the main thread to the browser thread. Let's use the `node`
-pointer (but the pointer only). Add another `DisplayItem` constructor parameter
-indicating the `node` that the `DisplayItem` belongs to (the one that painted
-it); this will be useful when keeping track of mappings between `DisplayItem`s
-and GPU textures.
-
-``` {.python
+``` {.python}
 class DisplayItem:
     def __init__(self, rect, children=[], node=None):
         # ...
         self.node = node
 ```
 
-When animations update, let's add code to pass the node and visual effects that
-changed from one thread to the other. This will have multiple steps:
+This way, the browser can note down which notes have animated, and
+pass that to the browser thread to determine which `DisplayItem`s may
+have changed and thus whether the `CompositedLayer`s have changed.
+There's going to be a lot of steps here, but it's not too difficult.
 
-* If a composited animation is running, and it's the only thing
-  happening to the DOM, then only re-do `paint` (in order to update
-  the animated `DisplayItem`s), not `layout`:
-
-``` {.python replace=if%20property_name/if%20USE_COMPOSITING%20and%20property_name}
-class Tab:
-    def set_needs_paint(self):
-        self.needs_paint = True
-        self.browser.set_needs_animation_frame(self)
-```
-
-* Save off each `Element` that updates its composited animation, in a new
-array called `composited_animation_updates`:
+First, when animations run, we need to remember which nodes are
+affected. We can do that with a `composited_animation_updates` list
+that stores all animated nodes:
 
 ``` {.python expected=False}
 class Tab:
@@ -1462,23 +1450,28 @@ class Tab:
                         self.set_needs_layout()
 ```
 
-* When running animation frames, if only `needs_paint` is true, then compositing
-  is not needed, and each animation in `composited_animation_updates` can be
-  committed across to the browser thread. The data to be sent across for each
-  animation update will be a DOM `Element` and a `SaveLayer` pointer.
+Note that I'm only appending the node if it's the `opacity` property
+that is being animated. That's because `opacity` only affects paint, a
+single operator in the display list. Another property like `width` or
+`font-size` affects layout, which means the display list can change is
+major ways (like due to different line breaks).
 
-  To accomplish this we'll need several steps. First, when painting a
-  `SaveLayer`, record it on the `Element` if it was composited:
+That's also why for `opacity` I'm setting `needs_paint` while for
+other properties I'm setting `needs_layout`. The `set_needs_paint`
+function is new but straightforward:
 
-``` {.python expected=False}
-def paint_visual_effects(node, cmds, rect):
-    # ...
-    if save_layer.needs_compositing():
-        node.save_layer = save_layer
+``` {.python}
+class Tab:
+    def set_needs_paint(self):
+        self.needs_paint = True
+        self.browser.set_needs_animation_frame(self)
 ```
 
-  Next rename `CommitForRaster` to `CommitData` and add a list of composited
-  updates (each of which will contain the `Element` and `SaveLayer` pointers).
+Now that we know what elements changed, we will want to skip the 
+
+Now we can send these `composited_animation_updates` to the browser
+thread on each frame. Let's rename `CommitForRaster` to `CommitData`
+and add a list of composited updates:
 
 ``` {.python}
 class CommitData:
@@ -1488,7 +1481,8 @@ class CommitData:
         self.composited_updates = composited_updates
 ```
 
-  And finally, commit the new information:
+On the browser tab, we'll want to reconstruct the _new_ draw display
+list, without changing 
 
 ``` {.python expected=False}
 class Tab:
@@ -1509,6 +1503,22 @@ class Tab:
             # ...
             composited_updates=composited_updates,
         )
+```
+
+
+* When running animation frames, if only `needs_paint` is true, then compositing
+  is not needed, and each animation in `composited_animation_updates` can be
+  committed across to the browser thread. The data to be sent across for each
+  animation update will be a DOM `Element` and a `SaveLayer` pointer.
+
+  To accomplish this we'll need several steps. First, when painting a
+  `SaveLayer`, record it on the `Element` if it was composited:
+
+``` {.python expected=False}
+def paint_visual_effects(node, cmds, rect):
+    # ...
+    if save_layer.needs_compositing():
+        node.save_layer = save_layer
 ```
 
 Now for the browser thread.
